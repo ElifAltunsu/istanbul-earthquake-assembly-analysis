@@ -1,290 +1,436 @@
--- Final 2025 neighborhood dataset 
-DROP MATERIALIZED VIEW IF EXISTS gis.mahalleler_2025_final CASCADE;
+/*
+=====================================================================
+ISTANBUL EMERGENCY ASSEMBLY AREA ANALYSIS
+02 - SPATIAL ANALYSIS
+=====================================================================
+*/
 
-CREATE MATERIALIZED VIEW gis.mahalleler_2025_final AS
 
-/* =====================================================
-   The other 36 district
-   ===================================================== */
+-- ================================================================
+-- 1. VALIDATE ASSEMBLY POINT DATA
+-- ================================================================
+
 SELECT
-    m."ILCEADI",
-    m.mahalle_adi_2025,
-    m.nufus_2025,
-    m.mahalle_id,
+    COUNT(*) AS total_points,
+    COUNT(DISTINCT objectid) AS unique_objectids,
+    COUNT(*) - COUNT(DISTINCT objectid) AS duplicate_objectids
+FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm";
 
-    'mevcut_geometri'::text
-        AS geometri_kaynagi,
 
-    ST_Multi(
-        ST_CollectionExtract(
-            ST_MakeValid(
-                ST_CurveToLine(m.geom)
-            ),
-            3
-        )
-    )::geometry(MultiPolygon,32635)
-        AS geom
+/*
+Expected:
 
-FROM gis.mahalleler_2025_temiz m
+total_points       = 5599
+unique_objectids   = 5599
+duplicate_objectids = 0
+*/
 
-WHERE m."ILCEADI" NOT IN (
-    'ESENLER',
-    'ESENYURT',
-    'EYÜPSULTAN'
+
+
+-- ================================================================
+-- 2. ASSIGN EACH ASSEMBLY POINT TO ONE NEIGHBORHOOD
+-- ================================================================
+/*
+Most assembly points fall directly inside exactly one neighborhood.
+
+ST_Covers is used instead of ST_Contains so points located directly
+on polygon boundaries are also considered.
+
+Assignment logic:
+
+1. One matching neighborhood
+      -> spatial_exact
+
+2. More than one matching neighborhood
+      -> boundary_resolved
+
+3. No matching neighborhood
+      -> nearest_fallback
+
+This guarantees that every assembly point is assigned exactly once.
+*/
+
+
+DROP MATERIALIZED VIEW IF EXISTS
+gis.toplanma_mahalle_atama_2025 CASCADE;
+
+
+CREATE MATERIALIZED VIEW
+gis.toplanma_mahalle_atama_2025 AS
+
+
+WITH candidate_counts AS (
+
+    SELECT
+        p.objectid,
+
+        COUNT(m.mahalle_id)
+            AS candidate_count
+
+    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" p
+
+    LEFT JOIN gis.mahalleler_2025_final m
+        ON ST_Covers(m.geom, p.geom)
+
+    GROUP BY p.objectid
+),
+
+
+-- ------------------------------------------------
+-- Select one neighborhood from spatial matches
+-- ------------------------------------------------
+
+exact_candidates AS (
+
+    SELECT
+        p.objectid,
+        m.mahalle_id,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY p.objectid
+
+            ORDER BY
+                ST_Distance(
+                    ST_PointOnSurface(m.geom),
+                    p.geom
+                ),
+                m.mahalle_id
+        ) AS rn
+
+    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" p
+
+    JOIN gis.mahalleler_2025_final m
+        ON ST_Covers(m.geom, p.geom)
+),
+
+
+chosen_exact AS (
+
+    SELECT
+        objectid,
+        mahalle_id
+
+    FROM exact_candidates
+
+    WHERE rn = 1
+),
+
+
+-- ------------------------------------------------
+-- Find nearest neighborhood only when no spatial
+-- match exists
+-- ------------------------------------------------
+
+nearest_fallback AS (
+
+    SELECT
+        p.objectid,
+        nearest_mahalle.mahalle_id
+
+    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" p
+
+    JOIN candidate_counts c
+        ON c.objectid = p.objectid
+
+    CROSS JOIN LATERAL (
+
+        SELECT
+            m.mahalle_id
+
+        FROM gis.mahalleler_2025_final m
+
+        ORDER BY
+            m.geom <-> p.geom,
+            m.mahalle_id
+
+        LIMIT 1
+
+    ) nearest_mahalle
+
+    WHERE c.candidate_count = 0
 )
 
 
-UNION ALL
-
-
-/* =====================================================
-   Updated 3 districts
-   ===================================================== */
 SELECT
-    g."ILCEADI",
-    n.mahalle_adi
-        AS mahalle_adi_2025,
 
-    n.nufus
-        AS nufus_2025,
+    p.objectid,
 
-    n.mahalle_id,
+    COALESCE(
+        e.mahalle_id,
+        n.mahalle_id
+    ) AS mahalle_id,
 
-    'osm_guncel_3_ilce'::text
-        AS geometri_kaynagi,
+    CASE
 
-    ST_Multi(
-        ST_CollectionExtract(
-            ST_MakeValid(
-                ST_CurveToLine(g.geom)
-            ),
-            3
-        )
-    )::geometry(MultiPolygon,32635)
-        AS geom
+        WHEN c.candidate_count = 1
+            THEN 'spatial_exact'
 
-FROM gis.guncel_3_ilce_mahalle_hazir g
+        WHEN c.candidate_count > 1
+            THEN 'boundary_resolved'
 
-JOIN gis.mahalle_nufus_2025 n
+        ELSE 'nearest_fallback'
 
-ON
+    END AS assignment_method,
 
-regexp_replace(
-    lower(unaccent(g."ILCEADI")),
-    '[^a-z0-9]',
-    '',
-    'g'
-)
+    p.geom
 
-=
-
-regexp_replace(
-    lower(unaccent(n.ilce_adi)),
-    '[^a-z0-9]',
-    '',
-    'g'
-)
+FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" p
 
 
-AND
+JOIN candidate_counts c
+    ON c.objectid = p.objectid
 
 
-regexp_replace(
-    regexp_replace(
-        lower(unaccent(g.mahalle_adi)),
-        '\s+mahallesi.*$',
-        ''
-    ),
-    '[^a-z0-9]',
-    '',
-    'g'
-)
+LEFT JOIN chosen_exact e
+    ON e.objectid = p.objectid
 
-=
 
-regexp_replace(
-    regexp_replace(
-        lower(unaccent(n.mahalle_adi)),
-        '\s+mahallesi.*$',
-        ''
-    ),
-    '[^a-z0-9]',
-    '',
-    'g'
-);
+LEFT JOIN nearest_fallback n
+    ON n.objectid = p.objectid;
 
--- Creating Indexes
-CREATE INDEX idx_mahalleler_2025_final_geom
-ON gis.mahalleler_2025_final
+
+
+-- ================================================================
+-- 3. INDEXES
+-- ================================================================
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+uq_toplanma_mahalle_atama_2025_objectid
+ON gis.toplanma_mahalle_atama_2025 (objectid);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_toplanma_mahalle_atama_2025_mahalle
+ON gis.toplanma_mahalle_atama_2025 (mahalle_id);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_toplanma_mahalle_atama_2025_geom
+ON gis.toplanma_mahalle_atama_2025
 USING GIST (geom);
 
 
--- Creating one main analysis table
-DROP MATERIALIZED VIEW IF EXISTS gis.mahalle_analiz_2025 CASCADE;
+ANALYZE gis.toplanma_mahalle_atama_2025;
 
-CREATE MATERIALIZED VIEW gis.mahalle_analiz_2025 AS
+
+
+-- ================================================================
+-- 4. VALIDATE FINAL ASSIGNMENT
+-- ================================================================
 
 SELECT
-    m.*,
 
-    COALESCE(c.toplanma_sayisi, 0)::integer
-        AS toplanma_sayisi,
+    COUNT(*) AS total_points,
 
-    nearest.mesafe_m,
+    COUNT(DISTINCT objectid)
+        AS unique_points,
 
-    ROUND(
-        (
-            COALESCE(c.toplanma_sayisi, 0)::numeric
-            / NULLIF(m.nufus_2025, 0)
-        ) * 10000,
-        2
-    ) AS onbin_kisi_basina_toplanma_alani
+    COUNT(*) FILTER (
+        WHERE assignment_method = 'spatial_exact'
+    ) AS spatial_exact,
 
-FROM gis.mahalleler_2025_temiz m
+    COUNT(*) FILTER (
+        WHERE assignment_method = 'boundary_resolved'
+    ) AS boundary_resolved,
 
-LEFT JOIN LATERAL (
+    COUNT(*) FILTER (
+        WHERE assignment_method = 'nearest_fallback'
+    ) AS nearest_fallback
+
+FROM gis.toplanma_mahalle_atama_2025;
+
+
+/*
+Expected:
+
+total_points       = 5599
+unique_points      = 5599
+spatial_exact      = 5586
+boundary_resolved  = 2
+nearest_fallback   = 11
+*/
+
+
+
+-- ================================================================
+-- 5. BUILD NEIGHBORHOOD-LEVEL ANALYSIS TABLE
+-- ================================================================
+/*
+The final analysis table contains one record per neighborhood.
+
+Metrics:
+
+toplanma_sayisi
+    Number of assigned emergency assembly points.
+
+mesafe_m
+    Distance from a representative point inside the neighborhood
+    to the nearest assembly point.
+
+onbin_kisi_basina_toplanma_noktasi
+    Number of assembly points per 10,000 residents.
+
+Important:
+The source dataset contains assembly POINT locations rather than
+assembly-area polygons. Therefore, this metric represents point
+availability and should not be interpreted as physical capacity.
+*/
+
+
+DROP MATERIALIZED VIEW IF EXISTS
+gis.mahalle_analiz_2025 CASCADE;
+
+
+CREATE MATERIALIZED VIEW
+gis.mahalle_analiz_2025 AS
+
+
+WITH point_counts AS (
 
     SELECT
+        mahalle_id,
         COUNT(*) AS toplanma_sayisi
 
-    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" t
+    FROM gis.toplanma_mahalle_atama_2025
 
-    WHERE ST_Covers(
-        m.geom,
-        t.geom
-    )
+    GROUP BY mahalle_id
+)
 
-) c ON TRUE
+
+SELECT
+
+    m.ilceadi,
+
+    m.mahalle_adi_2025,
+
+    m.nufus_2025,
+
+    m.mahalle_id,
+
+    m.geom,
+
+
+    -- ------------------------------------------------
+    -- Number of assembly points
+    -- ------------------------------------------------
+
+    COALESCE(
+        pc.toplanma_sayisi,
+        0
+    )::integer
+        AS toplanma_sayisi,
+
+
+    -- ------------------------------------------------
+    -- Distance to nearest assembly point
+    -- ------------------------------------------------
+
+    ROUND(
+        nearest_point.mesafe_m::numeric,
+        1
+    ) AS mesafe_m,
+
+
+    -- ------------------------------------------------
+    -- Assembly points per 10,000 residents
+    -- ------------------------------------------------
+
+    CASE
+
+        WHEN m.nufus_2025 > 0
+
+        THEN ROUND(
+
+            (
+                COALESCE(
+                    pc.toplanma_sayisi,
+                    0
+                )::numeric
+
+                / m.nufus_2025::numeric
+
+            ) * 10000,
+
+            3
+        )
+
+        ELSE NULL
+
+    END AS onbin_kisi_basina_toplanma_noktasi
+
+
+FROM gis.mahalleler_2025_final m
+
+
+LEFT JOIN point_counts pc
+    ON pc.mahalle_id = m.mahalle_id
+
 
 LEFT JOIN LATERAL (
 
     SELECT
+
         ST_Distance(
             ST_PointOnSurface(m.geom),
-            t.geom
+            a.geom
         ) AS mesafe_m
 
-    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" t
+    FROM gis.toplanma_mahalle_atama_2025 a
 
     ORDER BY
-        ST_PointOnSurface(m.geom) <-> t.geom
+        ST_PointOnSurface(m.geom) <-> a.geom
 
     LIMIT 1
 
-) nearest ON TRUE;
+) nearest_point
+ON TRUE;
 
--- Creating spatial indexes
-CREATE INDEX idx_mahalle_analiz_2025_geom
+
+
+-- ================================================================
+-- 6. FINAL ANALYSIS INDEXES
+-- ================================================================
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+uq_mahalle_analiz_2025_mahalle_id
+ON gis.mahalle_analiz_2025 (mahalle_id);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_mahalle_analiz_2025_geom
 ON gis.mahalle_analiz_2025
 USING GIST (geom);
 
 
--- Assigning each assembly point to exactly one neighborhood
-DROP MATERIALIZED VIEW IF EXISTS gis.toplanma_mahalle_atama_2025 CASCADE;
+ANALYZE gis.mahalle_analiz_2025;
 
-CREATE MATERIALIZED VIEW gis.toplanma_mahalle_atama_2025 AS
 
-WITH cover_counts AS (
 
-    SELECT
-        t.objectid,
-        COUNT(m.mahalle_id) AS cover_count
-
-    FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" t
-
-    LEFT JOIN gis.mahalleler_2025_final m
-        ON ST_Covers(m.geom, t.geom)
-
-    GROUP BY t.objectid
-)
+-- ================================================================
+-- 7. FINAL VALIDATION
+-- ================================================================
 
 SELECT
-    t.objectid,
-    t.toplanma_alan_ad,
 
-    t.mahalle_adi AS kaynak_mahalle,
+    COUNT(*) AS neighborhood_count,
 
-    secilen.mahalle_id,
-    secilen."ILCEADI",
-    secilen.mahalle_adi_2025,
+    COUNT(DISTINCT mahalle_id)
+        AS unique_neighborhoods,
 
-    c.cover_count,
+    SUM(nufus_2025)
+        AS total_population,
 
-    CASE
-        WHEN c.cover_count = 1
-            THEN 'spatial_exact'
+    SUM(toplanma_sayisi)
+        AS assigned_assembly_points
 
-        WHEN c.cover_count > 1
-            THEN 'boundary_resolved'
+FROM gis.mahalle_analiz_2025;
 
-        ELSE
-            'nearest_fallback'
-    END AS atama_yontemi,
 
-    ROUND(
-        secilen.mesafe_m::numeric,
-        2
-    ) AS atama_mesafe_m,
+/*
+Expected:
 
-    t.geom
-
-FROM gis."istanbul_deprem_analizi — toplanma_alanlari_utm" t
-
-JOIN cover_counts c
-    ON t.objectid = c.objectid
-
-CROSS JOIN LATERAL (
-
-    SELECT
-        m.mahalle_id,
-        m."ILCEADI",
-        m.mahalle_adi_2025,
-
-        ST_Distance(
-            t.geom,
-            m.geom
-        ) AS mesafe_m
-
-    FROM gis.mahalleler_2025_final m
-
-    ORDER BY
-
-        /* First, the polygon that covers the point*/
-        CASE
-            WHEN ST_Covers(m.geom, t.geom)
-                THEN 0
-            ELSE 1
-        END,
-
-        /* Second, finding the closest neighborhood geometrically */
-        ST_Distance(t.geom, m.geom),
-
-        /* When there's boundary evennes, choosing source neighborhood name */
-        CASE
-            WHEN regexp_replace(
-                    lower(unaccent(m.mahalle_adi_2025)),
-                    '[^a-z0-9]',
-                    '',
-                    'g'
-                 )
-                 =
-                 regexp_replace(
-                    lower(unaccent(t.mahalle_adi)),
-                    '[^a-z0-9]',
-                    '',
-                    'g'
-                 )
-            THEN 0
-            ELSE 1
-        END,
-
-        ST_Distance(
-            t.geom,
-            ST_PointOnSurface(m.geom)
-        ),
-
-        m.mahalle_id
-
-    LIMIT 1
-
-) secilen;
+neighborhood_count        = 963
+unique_neighborhoods      = 963
+total_population          = 15753753
+assigned_assembly_points  = 5599
+*/
